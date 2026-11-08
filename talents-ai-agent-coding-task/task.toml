@@ -1,0 +1,38 @@
+schema_version = "1.4"
+artifacts = []
+
+[task]
+name = "myorg/graph-database-abstract-factory"
+version = "1.0.0"
+description = "Refactor the graph database layer of a Java webservice from switch-based factories into the Abstract Factory pattern (one self-contained family of products and factory per database, with the shared code knowing only the abstractions), and make the single driver connection each factory now shares between its products safe for concurrent use: concurrent connects open one connection, and closing the factory never waits for a connect in progress nor leaks a connection."
+authors = [{ name = "MyOrg" }]
+keywords = ["java", "maven", "refactoring", "design-pattern", "abstract-factory", "graph-database", "concurrency"]
+
+[metadata]
+difficulty = "hard"
+category = "refactoring"
+tags = ["java", "abstract-factory", "design-pattern", "package-structure", "concurrency", "resource-lifecycle"]
+expert_time_estimate_min = 90
+junior_time_estimate_min = 480
+
+[verifier]
+timeout_sec = 1800.0
+collect = []
+
+[verifier.env]
+
+[agent]
+timeout_sec = 3600.0
+
+[environment]
+network_mode = "public"
+build_timeout_sec = 1800.0
+os = "linux"
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+mcp_servers = []
+
+[environment.env]
+
+[solution.env]

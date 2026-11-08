@@ -1,0 +1,1827 @@
+diff --git a/src/main/java/com/myorg/webservice/graph/ArangoStatsAdapter.java b/src/main/java/com/myorg/webservice/graph/ArangoStatsAdapter.java
+deleted file mode 100644
+index 0293f19..0000000
+--- a/src/main/java/com/myorg/webservice/graph/ArangoStatsAdapter.java
++++ /dev/null
+@@ -1,101 +0,0 @@
+-package com.myorg.webservice.graph;
+-
+-import com.arangodb.ArangoCursor;
+-import com.arangodb.ArangoDB;
+-import com.arangodb.ArangoDatabase;
+-import com.arangodb.Protocol;
+-import java.io.IOException;
+-import java.net.URI;
+-import java.time.Duration;
+-import java.util.Map;
+-
+-/** ArangoDB implementation of {@link GraphStats}, over the collections of {@link ArangoDbAdapter}. */
+-public class ArangoStatsAdapter implements GraphStats {
+-
+-    private static final System.Logger LOG = System.getLogger(ArangoStatsAdapter.class.getName());
+-
+-    private final String url;
+-    private final String user;
+-    private final String password;
+-    private final String databaseName;
+-    private ArangoDB arango;
+-    private ArangoDatabase database;
+-
+-    public ArangoStatsAdapter(String url, String user, String password, String databaseName) {
+-        this.url = url;
+-        this.user = user;
+-        this.password = password;
+-        this.databaseName = databaseName;
+-    }
+-
+-    @Override
+-    public void connect() {
+-        URI uri = URI.create(url);
+-        boolean ssl = "https".equalsIgnoreCase(uri.getScheme());
+-        int port = uri.getPort() > 0 ? uri.getPort() : (ssl ? 443 : 8529);
+-        arango = new ArangoDB.Builder()
+-                .host(uri.getHost(), port)
+-                .useSsl(ssl)
+-                .user(user)
+-                .password(password)
+-                .protocol(Protocol.HTTP_JSON)
+-                .build();
+-        RuntimeException last = null;
+-        for (int attempt = 1; attempt <= 30; attempt++) {
+-            try {
+-                ArangoDatabase target = arango.db(databaseName);
+-                target.getVersion();
+-                database = target;
+-                return;
+-            } catch (RuntimeException e) {
+-                last = e;
+-                LOG.log(System.Logger.Level.WARNING, "Failed to connect to ArangoDB (attempt {0}): {1}", attempt,
+-                        e.getMessage());
+-                sleep(Duration.ofSeconds(2));
+-            }
+-        }
+-        arango.shutdown();
+-        arango = null;
+-        throw new IllegalStateException("Cannot connect to ArangoDB at " + url, last);
+-    }
+-
+-    @Override
+-    public long vertexCount() {
+-        return count("RETURN LENGTH(vertices)", Map.of());
+-    }
+-
+-    @Override
+-    public long edgeCount() {
+-        return count("RETURN LENGTH(edges)", Map.of());
+-    }
+-
+-    @Override
+-    public long outDegree(String id) {
+-        return count("RETURN LENGTH(FOR e IN edges FILTER e._from == @from RETURN 1)",
+-                Map.of("from", ArangoDbAdapter.VERTICES + "/" + id));
+-    }
+-
+-    @Override
+-    public void close() {
+-        if (arango != null) {
+-            arango.shutdown();
+-            arango = null;
+-        }
+-    }
+-
+-    private long count(String query, Map<String, Object> bindVars) {
+-        try (ArangoCursor<Long> cursor = database.query(query, Long.class, bindVars)) {
+-            return cursor.next();
+-        } catch (IOException e) {
+-            throw new IllegalStateException(e);
+-        }
+-    }
+-
+-    private static void sleep(Duration interval) {
+-        try {
+-            Thread.sleep(interval);
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
+-        }
+-    }
+-}
+diff --git a/src/main/java/com/myorg/webservice/graph/GraphDb.java b/src/main/java/com/myorg/webservice/graph/GraphDatabase.java
+similarity index 76%
+rename from src/main/java/com/myorg/webservice/graph/GraphDb.java
+rename to src/main/java/com/myorg/webservice/graph/GraphDatabase.java
+index d1bdd36..cf0bf8d 100644
+--- a/src/main/java/com/myorg/webservice/graph/GraphDb.java
++++ b/src/main/java/com/myorg/webservice/graph/GraphDatabase.java
+@@ -8,12 +8,16 @@ import java.util.Optional;
+  * Graph database of the webservice: vertices identified by a string ID, directed edges between them, and
+  * traversals.
+  *
+- * <p>Implementations: {@link ArangoDbAdapter} (AQL), {@link Neo4jAdapter} (Cypher) and {@link JanusGraphAdapter}
+- * (Gremlin). {@link GraphDbFactory#create} creates the one for a database type.
++ * <p>One of the abstract products of the {@link GraphDatabaseFactory}; it uses the connection of the factory that
++ * created it. Once the product or its factory is closed, every operation except {@link #close()} throws
++ * {@link IllegalStateException}.
+  */
+-public interface GraphDb extends AutoCloseable {
++public interface GraphDatabase extends AutoCloseable {
+ 
+-    /** Connects to the database, retrying while it is not ready yet. */
++    /**
++     * Opens the connection of the factory, retrying while the database is not ready yet; does nothing if it is
++     * already open.
++     */
+     void connect();
+ 
+     /** Creates the database objects (collections, graph definition) if they are missing; idempotent. */
+@@ -56,6 +60,7 @@ public interface GraphDb extends AutoCloseable {
+      */
+     List<String> neighbors(String id, int depth);
+ 
++    /** Releases this product only; the connection of the factory stays open for its other products. */
+     @Override
+     void close();
+ }
+diff --git a/src/main/java/com/myorg/webservice/graph/GraphDatabaseFactory.java b/src/main/java/com/myorg/webservice/graph/GraphDatabaseFactory.java
+new file mode 100644
+index 0000000..81506c2
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/GraphDatabaseFactory.java
+@@ -0,0 +1,32 @@
++package com.myorg.webservice.graph;
++
++/**
++ * Abstract factory of the graph database layer: creates the products of one database family, which always match each
++ * other.
++ *
++ * <p>Each database is a family in its own subpackage with its concrete products and its concrete factory, which takes
++ * only the connection parameters of its own database. A factory holds exactly one driver connection, opened by the
++ * first {@code connect()} of one of its products and shared by all of them; closing the factory closes it.
++ *
++ * <p><b>To add a database</b>, add a subpackage with its products and factory; no existing class changes.
++ */
++public interface GraphDatabaseFactory extends AutoCloseable {
++
++    /**
++     * Creates a new graph database of this family; it does not contact the database.
++     *
++     * @throws IllegalStateException if this factory is closed
++     */
++    GraphDatabase createDatabase();
++
++    /**
++     * Creates new statistics of this family; it does not contact the database.
++     *
++     * @throws IllegalStateException if this factory is closed
++     */
++    GraphStatistics createStatistics();
++
++    /** Closes the connection shared by the products of this factory; idempotent. */
++    @Override
++    void close();
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/GraphDbFactory.java b/src/main/java/com/myorg/webservice/graph/GraphDbFactory.java
+deleted file mode 100644
+index ad035a8..0000000
+--- a/src/main/java/com/myorg/webservice/graph/GraphDbFactory.java
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package com.myorg.webservice.graph;
+-
+-import java.util.Locale;
+-
+-/** Creates the {@link GraphDb} implementation of a database type. */
+-public final class GraphDbFactory {
+-
+-    private GraphDbFactory() {
+-    }
+-
+-    /**
+-     * Creates an unconnected instance; the caller is responsible for {@link GraphDb#connect()} and
+-     * {@link GraphDb#close()}.
+-     *
+-     * @param type     {@code arangodb}, {@code neo4j} or {@code janusgraph} (case-insensitive)
+-     * @param url      server URL (the Bolt URI for Neo4j)
+-     * @param user     user name; ignored by JanusGraph
+-     * @param password password; ignored by JanusGraph
+-     * @return the implementation for {@code type}; ArangoDB always uses the database named {@code graph}
+-     * @throws IllegalArgumentException if {@code type} is not supported
+-     */
+-    public static GraphDb create(String type, String url, String user, String password) {
+-        return switch (type.toLowerCase(Locale.ROOT)) {
+-            case "arangodb" -> new ArangoDbAdapter(url, user, password, "graph");
+-            case "neo4j" -> new Neo4jAdapter(url, user, password);
+-            case "janusgraph" -> new JanusGraphAdapter(url);
+-            default -> throw new IllegalArgumentException("Unsupported graph database type: " + type);
+-        };
+-    }
+-}
+diff --git a/src/main/java/com/myorg/webservice/graph/GraphStatistics.java b/src/main/java/com/myorg/webservice/graph/GraphStatistics.java
+new file mode 100644
+index 0000000..26cef1e
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/GraphStatistics.java
+@@ -0,0 +1,35 @@
++package com.myorg.webservice.graph;
++
++/**
++ * Read-only statistics over the graph stored by the {@link GraphDatabase} of the same factory, for monitoring.
++ *
++ * <p>One of the abstract products of the {@link GraphDatabaseFactory}; it uses the connection of the factory that
++ * created it. Once the product or its factory is closed, every operation except {@link #close()} throws
++ * {@link IllegalStateException}.
++ */
++public interface GraphStatistics extends AutoCloseable {
++
++    /**
++     * Opens the connection of the factory, retrying while the database is not ready yet; does nothing if it is
++     * already open.
++     */
++    void connect();
++
++    /** Number of vertices. */
++    long vertexCount();
++
++    /** Number of edges. */
++    long edgeCount();
++
++    /**
++     * Number of edges leaving a vertex.
++     *
++     * @param id vertex ID
++     * @return the number of outbound edges, or 0 if there is no such vertex
++     */
++    long outDegree(String id);
++
++    /** Releases this product only; the connection of the factory stays open for its other products. */
++    @Override
++    void close();
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/GraphStats.java b/src/main/java/com/myorg/webservice/graph/GraphStats.java
+deleted file mode 100644
+index 38f9393..0000000
+--- a/src/main/java/com/myorg/webservice/graph/GraphStats.java
++++ /dev/null
+@@ -1,31 +0,0 @@
+-package com.myorg.webservice.graph;
+-
+-/**
+- * Read-only statistics over the graph stored by {@link GraphDb}, for monitoring.
+- *
+- * <p>Implementations: {@link ArangoStatsAdapter} (AQL), {@link Neo4jStatsAdapter} (Cypher) and
+- * {@link JanusGraphStatsAdapter} (Gremlin). {@link GraphStatsFactory#create} creates the one for a database type; it
+- * must be the same type as the {@link GraphDb} whose data it reads.
+- */
+-public interface GraphStats extends AutoCloseable {
+-
+-    /** Connects to the database, retrying while it is not ready yet. */
+-    void connect();
+-
+-    /** Number of vertices. */
+-    long vertexCount();
+-
+-    /** Number of edges. */
+-    long edgeCount();
+-
+-    /**
+-     * Number of edges leaving a vertex.
+-     *
+-     * @param id vertex ID
+-     * @return the number of outbound edges, or 0 if there is no such vertex
+-     */
+-    long outDegree(String id);
+-
+-    @Override
+-    void close();
+-}
+diff --git a/src/main/java/com/myorg/webservice/graph/GraphStatsFactory.java b/src/main/java/com/myorg/webservice/graph/GraphStatsFactory.java
+deleted file mode 100644
+index 437b573..0000000
+--- a/src/main/java/com/myorg/webservice/graph/GraphStatsFactory.java
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package com.myorg.webservice.graph;
+-
+-import java.util.Locale;
+-
+-/** Creates the {@link GraphStats} implementation of a database type. */
+-public final class GraphStatsFactory {
+-
+-    private GraphStatsFactory() {
+-    }
+-
+-    /**
+-     * Creates an unconnected instance; the caller is responsible for {@link GraphStats#connect()} and
+-     * {@link GraphStats#close()}. Each instance opens its own connection.
+-     *
+-     * @param type     {@code arangodb}, {@code neo4j} or {@code janusgraph} (case-insensitive)
+-     * @param url      server URL (the Bolt URI for Neo4j)
+-     * @param user     user name; ignored by JanusGraph
+-     * @param password password; ignored by JanusGraph
+-     * @return the implementation for {@code type}; ArangoDB always uses the database named {@code graph}
+-     * @throws IllegalArgumentException if {@code type} is not supported
+-     */
+-    public static GraphStats create(String type, String url, String user, String password) {
+-        return switch (type.toLowerCase(Locale.ROOT)) {
+-            case "arangodb" -> new ArangoStatsAdapter(url, user, password, "graph");
+-            case "neo4j" -> new Neo4jStatsAdapter(url, user, password);
+-            case "janusgraph" -> new JanusGraphStatsAdapter(url);
+-            default -> throw new IllegalArgumentException("Unsupported graph database type: " + type);
+-        };
+-    }
+-}
+diff --git a/src/main/java/com/myorg/webservice/graph/JanusGraphStatsAdapter.java b/src/main/java/com/myorg/webservice/graph/JanusGraphStatsAdapter.java
+deleted file mode 100644
+index e3ccf52..0000000
+--- a/src/main/java/com/myorg/webservice/graph/JanusGraphStatsAdapter.java
++++ /dev/null
+@@ -1,88 +0,0 @@
+-package com.myorg.webservice.graph;
+-
+-import static org.apache.tinkerpop.gremlin.process.traversal.AnonymousTraversalSource.traversal;
+-
+-import java.net.URI;
+-import java.time.Duration;
+-import org.apache.tinkerpop.gremlin.driver.Cluster;
+-import org.apache.tinkerpop.gremlin.driver.remote.DriverRemoteConnection;
+-import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
+-
+-/** JanusGraph implementation of {@link GraphStats}, over the vertices and edges of {@link JanusGraphAdapter}. */
+-public class JanusGraphStatsAdapter implements GraphStats {
+-
+-    private static final System.Logger LOG = System.getLogger(JanusGraphStatsAdapter.class.getName());
+-
+-    private final String url;
+-    private Cluster cluster;
+-    private GraphTraversalSource g;
+-
+-    public JanusGraphStatsAdapter(String url) {
+-        this.url = url;
+-    }
+-
+-    @Override
+-    public void connect() {
+-        URI uri = URI.create(url);
+-        cluster = Cluster.build(uri.getHost())
+-                .port(uri.getPort() > 0 ? uri.getPort() : 8182)
+-                .path(uri.getPath() == null || uri.getPath().isEmpty() ? "/gremlin" : uri.getPath())
+-                .enableSsl("wss".equalsIgnoreCase(uri.getScheme()))
+-                .create();
+-        g = traversal().withRemote(DriverRemoteConnection.using(cluster, "g"));
+-        RuntimeException last = null;
+-        for (int attempt = 1; attempt <= 30; attempt++) {
+-            try {
+-                g.inject(1).next();
+-                return;
+-            } catch (RuntimeException e) {
+-                last = e;
+-                LOG.log(System.Logger.Level.WARNING, "Failed to connect to JanusGraph (attempt {0}): {1}", attempt,
+-                        e.getMessage());
+-                sleep(Duration.ofSeconds(2));
+-            }
+-        }
+-        close();
+-        throw new IllegalStateException("Cannot connect to JanusGraph at " + url, last);
+-    }
+-
+-    @Override
+-    public long vertexCount() {
+-        return g.V().hasLabel(JanusGraphAdapter.VERTEX).count().next();
+-    }
+-
+-    @Override
+-    public long edgeCount() {
+-        return g.E().hasLabel(JanusGraphAdapter.EDGE).count().next();
+-    }
+-
+-    @Override
+-    public long outDegree(String id) {
+-        return g.V().has(JanusGraphAdapter.VERTEX, JanusGraphAdapter.VERTEX_ID, id).outE(JanusGraphAdapter.EDGE)
+-                .count().next();
+-    }
+-
+-    @Override
+-    public void close() {
+-        if (g != null) {
+-            try {
+-                g.close();
+-            } catch (Exception e) {
+-                LOG.log(System.Logger.Level.WARNING, "Failed to close the JanusGraph traversal source", e);
+-            }
+-            g = null;
+-        }
+-        if (cluster != null) {
+-            cluster.close();
+-            cluster = null;
+-        }
+-    }
+-
+-    private static void sleep(Duration interval) {
+-        try {
+-            Thread.sleep(interval);
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
+-        }
+-    }
+-}
+diff --git a/src/main/java/com/myorg/webservice/graph/Neo4jStatsAdapter.java b/src/main/java/com/myorg/webservice/graph/Neo4jStatsAdapter.java
+deleted file mode 100644
+index 802f5a6..0000000
+--- a/src/main/java/com/myorg/webservice/graph/Neo4jStatsAdapter.java
++++ /dev/null
+@@ -1,80 +0,0 @@
+-package com.myorg.webservice.graph;
+-
+-import java.time.Duration;
+-import java.util.Map;
+-import org.neo4j.driver.AuthTokens;
+-import org.neo4j.driver.Driver;
+-import org.neo4j.driver.GraphDatabase;
+-
+-/** Neo4j implementation of {@link GraphStats}, over the nodes and relationships of {@link Neo4jAdapter}. */
+-public class Neo4jStatsAdapter implements GraphStats {
+-
+-    private static final System.Logger LOG = System.getLogger(Neo4jStatsAdapter.class.getName());
+-
+-    private final String uri;
+-    private final String user;
+-    private final String password;
+-    private Driver driver;
+-
+-    public Neo4jStatsAdapter(String uri, String user, String password) {
+-        this.uri = uri;
+-        this.user = user;
+-        this.password = password;
+-    }
+-
+-    @Override
+-    public void connect() {
+-        driver = GraphDatabase.driver(uri, AuthTokens.basic(user, password));
+-        RuntimeException last = null;
+-        for (int attempt = 1; attempt <= 30; attempt++) {
+-            try {
+-                driver.verifyConnectivity();
+-                return;
+-            } catch (RuntimeException e) {
+-                last = e;
+-                LOG.log(System.Logger.Level.WARNING, "Failed to connect to Neo4j (attempt {0}): {1}", attempt,
+-                        e.getMessage());
+-                sleep(Duration.ofSeconds(2));
+-            }
+-        }
+-        driver.close();
+-        driver = null;
+-        throw new IllegalStateException("Cannot connect to Neo4j at " + uri, last);
+-    }
+-
+-    @Override
+-    public long vertexCount() {
+-        return count("MATCH (v:Vertex) RETURN count(v) AS n", Map.of());
+-    }
+-
+-    @Override
+-    public long edgeCount() {
+-        return count("MATCH (:Vertex)-[e:EDGE]->(:Vertex) RETURN count(e) AS n", Map.of());
+-    }
+-
+-    @Override
+-    public long outDegree(String id) {
+-        return count("MATCH (v:Vertex {vertexId: $id})-[e:EDGE]->() RETURN count(e) AS n", Map.of("id", id));
+-    }
+-
+-    @Override
+-    public void close() {
+-        if (driver != null) {
+-            driver.close();
+-            driver = null;
+-        }
+-    }
+-
+-    private long count(String query, Map<String, Object> parameters) {
+-        return driver.executableQuery(query).withParameters(parameters).execute()
+-                .records().get(0).get("n").asLong();
+-    }
+-
+-    private static void sleep(Duration interval) {
+-        try {
+-            Thread.sleep(interval);
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
+-        }
+-    }
+-}
+diff --git a/src/main/java/com/myorg/webservice/graph/arango/ArangoConnection.java b/src/main/java/com/myorg/webservice/graph/arango/ArangoConnection.java
+new file mode 100644
+index 0000000..7d0f59c
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/arango/ArangoConnection.java
+@@ -0,0 +1,173 @@
++package com.myorg.webservice.graph.arango;
++
++import com.arangodb.ArangoDB;
++import com.arangodb.Protocol;
++import java.net.URI;
++import java.time.Duration;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * The single ArangoDB driver connection of an {@link ArangoDatabaseFactory}, shared by all its products, which may use
++ * it from several threads. It is opened by the first product that connects and closed only by the factory.
++ *
++ * <p>The lock of this object guards the state only: it is never held while the server is contacted or between
++ * attempts, so that {@link #close()} never waits for a connect in progress.
++ */
++final class ArangoConnection {
++
++    private static final System.Logger LOG = System.getLogger(ArangoConnection.class.getName());
++
++    private final String url;
++    private final String user;
++    private final String password;
++    private final String databaseName;
++    private ArangoDB arango;
++    private com.arangodb.ArangoDatabase database;
++    private boolean opening;
++    private boolean closed;
++
++    ArangoConnection(String url, String user, String password, String databaseName) {
++        this.url = url;
++        this.user = user;
++        this.password = password;
++        this.databaseName = databaseName;
++    }
++
++    /**
++     * Connects to the server and creates the database if it is missing; does nothing if already connected.
++     * Concurrent calls wait for the one that is connecting instead of opening a driver of their own, and try
++     * themselves only if it fails. Closing the connection stops the attempts, and a driver that connects after the
++     * close is closed again.
++     *
++     * @param attempts number of attempts; the server may still be starting
++     * @param interval pause between attempts
++     * @throws IllegalStateException if the server cannot be reached or the connection is closed
++     */
++    void open(int attempts, Duration interval) {
++        if (!claimOpening()) {
++            return;
++        }
++        ArangoDB candidate = null;
++        try {
++            URI uri = URI.create(url);
++            boolean ssl = "https".equalsIgnoreCase(uri.getScheme());
++            int port = uri.getPort() > 0 ? uri.getPort() : (ssl ? 443 : 8529);
++            candidate = new ArangoDB.Builder()
++                    .host(uri.getHost(), port)
++                    .useSsl(ssl)
++                    .user(user)
++                    .password(password)
++                    .protocol(Protocol.HTTP_JSON)
++                    .build();
++            com.arangodb.ArangoDatabase connected = null;
++            RuntimeException last = null;
++            for (int attempt = 1; attempt <= attempts && connected == null; attempt++) {
++                checkNotClosed();
++                try {
++                    com.arangodb.ArangoDatabase target = candidate.db(databaseName);
++                    if (!target.exists()) {
++                        candidate.createDatabase(databaseName);
++                    }
++                    target.getVersion();
++                    connected = target;
++                } catch (RuntimeException e) {
++                    last = e;
++                    LOG.log(System.Logger.Level.WARNING, "Failed to connect to ArangoDB (attempt {0}): {1}", attempt,
++                            e.getMessage());
++                    pause(interval);
++                }
++            }
++            if (connected == null) {
++                throw new IllegalStateException("Cannot connect to ArangoDB at " + url, last);
++            }
++            publish(candidate, connected);
++            candidate = null;
++            LOG.log(System.Logger.Level.INFO, "Connected to ArangoDB {0}/{1}", url, databaseName);
++        } finally {
++            if (candidate != null) {
++                candidate.shutdown();
++            }
++            finishOpening();
++        }
++    }
++
++    /**
++     * The connected database.
++     *
++     * @throws IllegalStateException if the connection is not open
++     */
++    synchronized com.arangodb.ArangoDatabase database() {
++        checkNotClosed();
++        if (database == null) {
++            throw new IllegalStateException("Not connected to ArangoDB; call connect() first");
++        }
++        return database;
++    }
++
++    synchronized void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("The ArangoDB connection is closed");
++        }
++    }
++
++    synchronized void close() {
++        closed = true;
++        notifyAll();
++        database = null;
++        if (arango != null) {
++            arango.shutdown();
++            arango = null;
++        }
++    }
++
++    /**
++     * Waits until no other thread is connecting.
++     *
++     * @return {@code true} if the caller must connect, {@code false} if the connection is open already
++     */
++    private synchronized boolean claimOpening() {
++        while (true) {
++            checkNotClosed();
++            if (database != null) {
++                return false;
++            }
++            if (!opening) {
++                opening = true;
++                return true;
++            }
++            try {
++                wait();
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                throw new IllegalStateException("Interrupted while waiting for the ArangoDB connection", e);
++            }
++        }
++    }
++
++    /** Keeps the connected driver, unless the connection was closed meanwhile. */
++    private synchronized void publish(ArangoDB connectedDriver, com.arangodb.ArangoDatabase connectedDatabase) {
++        checkNotClosed();
++        arango = connectedDriver;
++        database = connectedDatabase;
++    }
++
++    private synchronized void finishOpening() {
++        opening = false;
++        notifyAll();
++    }
++
++    /** Waits for the pause between attempts, or less if the connection is closed meanwhile. */
++    private synchronized void pause(Duration interval) {
++        long deadline = System.nanoTime() + interval.toNanos();
++        long remaining = interval.toNanos();
++        while (!closed && remaining > 0) {
++            try {
++                TimeUnit.NANOSECONDS.timedWait(this, remaining);
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                return;
++            }
++            remaining = deadline - System.nanoTime();
++        }
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/ArangoDbAdapter.java b/src/main/java/com/myorg/webservice/graph/arango/ArangoDatabase.java
+similarity index 58%
+rename from src/main/java/com/myorg/webservice/graph/ArangoDbAdapter.java
+rename to src/main/java/com/myorg/webservice/graph/arango/ArangoDatabase.java
+index 41f1764..9ccc08f 100644
+--- a/src/main/java/com/myorg/webservice/graph/ArangoDbAdapter.java
++++ b/src/main/java/com/myorg/webservice/graph/arango/ArangoDatabase.java
+@@ -1,16 +1,13 @@
+-package com.myorg.webservice.graph;
++package com.myorg.webservice.graph.arango;
+ 
+ import com.arangodb.ArangoCollection;
+ import com.arangodb.ArangoCursor;
+-import com.arangodb.ArangoDB;
+-import com.arangodb.ArangoDatabase;
+-import com.arangodb.Protocol;
+ import com.arangodb.entity.CollectionType;
+ import com.arangodb.entity.EdgeDefinition;
+ import com.arangodb.model.CollectionCreateOptions;
+ import com.arangodb.model.DocumentCreateOptions;
+ import com.arangodb.model.OverwriteMode;
+-import java.net.URI;
++import com.myorg.webservice.graph.GraphDatabase;
+ import java.time.Duration;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -18,31 +15,22 @@ import java.util.Map;
+ import java.util.Optional;
+ 
+ /**
+- * ArangoDB implementation of {@link GraphDb}.
++ * ArangoDB product of {@link GraphDatabase}.
+  *
+  * <p>Vertices are documents in the {@value #VERTICES} collection (the vertex ID is the document key), edges are
+  * documents in the {@value #EDGES} edge collection, and the named graph {@value #GRAPH} joins the two for traversals.
+  */
+-public class ArangoDbAdapter implements GraphDb {
++public class ArangoDatabase implements GraphDatabase {
+ 
+     static final String VERTICES = "vertices";
+     static final String EDGES = "edges";
+     static final String GRAPH = "graph";
+ 
+-    private static final System.Logger LOG = System.getLogger(ArangoDbAdapter.class.getName());
++    private final ArangoConnection connection;
++    private volatile boolean closed;
+ 
+-    private final String url;
+-    private final String user;
+-    private final String password;
+-    private final String databaseName;
+-    private ArangoDB arango;
+-    private ArangoDatabase database;
+-
+-    public ArangoDbAdapter(String url, String user, String password, String databaseName) {
+-        this.url = url;
+-        this.user = user;
+-        this.password = password;
+-        this.databaseName = databaseName;
++    ArangoDatabase(ArangoConnection connection) {
++        this.connection = connection;
+     }
+ 
+     @Override
+@@ -51,48 +39,20 @@ public class ArangoDbAdapter implements GraphDb {
+     }
+ 
+     /**
+-     * Connects to the server and creates the database if it is missing.
++     * Opens the connection of the factory and creates the database if it is missing.
+      *
+      * @param attempts number of attempts; the server may still be starting
+      * @param interval pause between attempts
+      * @throws IllegalStateException if the server cannot be reached
+      */
+     public void connect(int attempts, Duration interval) {
+-        URI uri = URI.create(url);
+-        boolean ssl = "https".equalsIgnoreCase(uri.getScheme());
+-        int port = uri.getPort() > 0 ? uri.getPort() : (ssl ? 443 : 8529);
+-        arango = new ArangoDB.Builder()
+-                .host(uri.getHost(), port)
+-                .useSsl(ssl)
+-                .user(user)
+-                .password(password)
+-                .protocol(Protocol.HTTP_JSON)
+-                .build();
+-        RuntimeException last = null;
+-        for (int attempt = 1; attempt <= attempts; attempt++) {
+-            try {
+-                ArangoDatabase target = arango.db(databaseName);
+-                if (!target.exists()) {
+-                    arango.createDatabase(databaseName);
+-                }
+-                target.getVersion();
+-                database = target;
+-                LOG.log(System.Logger.Level.INFO, "Connected to ArangoDB {0}/{1}", url, databaseName);
+-                return;
+-            } catch (RuntimeException e) {
+-                last = e;
+-                LOG.log(System.Logger.Level.WARNING, "Failed to connect to ArangoDB (attempt {0}): {1}", attempt,
+-                        e.getMessage());
+-                sleep(interval);
+-            }
+-        }
+-        arango.shutdown();
+-        arango = null;
+-        throw new IllegalStateException("Cannot connect to ArangoDB at " + url, last);
++        checkNotClosed();
++        connection.open(attempts, interval);
+     }
+ 
+     @Override
+     public void ensureSchema() {
++        com.arangodb.ArangoDatabase database = database();
+         if (!database.collection(VERTICES).exists()) {
+             database.createCollection(VERTICES);
+         }
+@@ -108,7 +68,7 @@ public class ArangoDbAdapter implements GraphDb {
+     public void upsertVertex(String id, Map<String, Object> properties) {
+         Map<String, Object> document = new HashMap<>(properties);
+         document.put("_key", id);
+-        database.collection(VERTICES).insertDocument(document,
++        database().collection(VERTICES).insertDocument(document,
+                 new DocumentCreateOptions().overwriteMode(OverwriteMode.update));
+     }
+ 
+@@ -118,7 +78,7 @@ public class ArangoDbAdapter implements GraphDb {
+         bindVars.put("from", VERTICES + "/" + fromId);
+         bindVars.put("to", VERTICES + "/" + toId);
+         bindVars.put("properties", properties);
+-        database.query("""
++        database().query("""
+                 UPSERT {_from: @from, _to: @to}
+                 INSERT MERGE(@properties, {_from: @from, _to: @to})
+                 UPDATE @properties
+@@ -128,7 +88,7 @@ public class ArangoDbAdapter implements GraphDb {
+     @Override
+     @SuppressWarnings("unchecked")
+     public Optional<Map<String, Object>> findVertex(String id) {
+-        ArangoCollection vertices = database.collection(VERTICES);
++        ArangoCollection vertices = database().collection(VERTICES);
+         Map<String, Object> document = vertices.getDocument(id, Map.class);
+         if (document == null) {
+             return Optional.empty();
+@@ -140,6 +100,7 @@ public class ArangoDbAdapter implements GraphDb {
+ 
+     @Override
+     public List<String> neighbors(String id, int depth) {
++        com.arangodb.ArangoDatabase database = database();
+         if (depth < 1) {
+             return List.of();
+         }
+@@ -158,17 +119,17 @@ public class ArangoDbAdapter implements GraphDb {
+ 
+     @Override
+     public void close() {
+-        if (arango != null) {
+-            arango.shutdown();
+-            arango = null;
+-        }
++        closed = true;
++    }
++
++    private com.arangodb.ArangoDatabase database() {
++        checkNotClosed();
++        return connection.database();
+     }
+ 
+-    private static void sleep(Duration interval) {
+-        try {
+-            Thread.sleep(interval);
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
++    private void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("This ArangoDB graph database is closed");
+         }
+     }
+ }
+diff --git a/src/main/java/com/myorg/webservice/graph/arango/ArangoDatabaseFactory.java b/src/main/java/com/myorg/webservice/graph/arango/ArangoDatabaseFactory.java
+new file mode 100644
+index 0000000..567d527
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/arango/ArangoDatabaseFactory.java
+@@ -0,0 +1,38 @@
++package com.myorg.webservice.graph.arango;
++
++import com.myorg.webservice.graph.GraphDatabase;
++import com.myorg.webservice.graph.GraphDatabaseFactory;
++import com.myorg.webservice.graph.GraphStatistics;
++
++/** Concrete factory of the ArangoDB family. */
++public class ArangoDatabaseFactory implements GraphDatabaseFactory {
++
++    private final ArangoConnection connection;
++
++    /**
++     * @param url      server URL, e.g. {@code http://localhost:8529}
++     * @param user     user name
++     * @param password password
++     * @param database name of the database, created if it is missing
++     */
++    public ArangoDatabaseFactory(String url, String user, String password, String database) {
++        this.connection = new ArangoConnection(url, user, password, database);
++    }
++
++    @Override
++    public GraphDatabase createDatabase() {
++        connection.checkNotClosed();
++        return new ArangoDatabase(connection);
++    }
++
++    @Override
++    public GraphStatistics createStatistics() {
++        connection.checkNotClosed();
++        return new ArangoStatistics(connection);
++    }
++
++    @Override
++    public void close() {
++        connection.close();
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/arango/ArangoStatistics.java b/src/main/java/com/myorg/webservice/graph/arango/ArangoStatistics.java
+new file mode 100644
+index 0000000..5d919f5
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/arango/ArangoStatistics.java
+@@ -0,0 +1,60 @@
++package com.myorg.webservice.graph.arango;
++
++import com.arangodb.ArangoCursor;
++import com.myorg.webservice.graph.GraphStatistics;
++import java.io.IOException;
++import java.time.Duration;
++import java.util.Map;
++
++/** ArangoDB product of {@link GraphStatistics}, over the collections of {@link ArangoDatabase}. */
++public class ArangoStatistics implements GraphStatistics {
++
++    private final ArangoConnection connection;
++    private volatile boolean closed;
++
++    ArangoStatistics(ArangoConnection connection) {
++        this.connection = connection;
++    }
++
++    @Override
++    public void connect() {
++        checkNotClosed();
++        connection.open(30, Duration.ofSeconds(2));
++    }
++
++    @Override
++    public long vertexCount() {
++        return count("RETURN LENGTH(vertices)", Map.of());
++    }
++
++    @Override
++    public long edgeCount() {
++        return count("RETURN LENGTH(edges)", Map.of());
++    }
++
++    @Override
++    public long outDegree(String id) {
++        return count("RETURN LENGTH(FOR e IN edges FILTER e._from == @from RETURN 1)",
++                Map.of("from", ArangoDatabase.VERTICES + "/" + id));
++    }
++
++    @Override
++    public void close() {
++        closed = true;
++    }
++
++    private long count(String query, Map<String, Object> bindVars) {
++        checkNotClosed();
++        try (ArangoCursor<Long> cursor = connection.database().query(query, Long.class, bindVars)) {
++            return cursor.next();
++        } catch (IOException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    private void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("These ArangoDB statistics are closed");
++        }
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphConnection.java b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphConnection.java
+new file mode 100644
+index 0000000..213b864
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphConnection.java
+@@ -0,0 +1,174 @@
++package com.myorg.webservice.graph.janusgraph;
++
++import static org.apache.tinkerpop.gremlin.process.traversal.AnonymousTraversalSource.traversal;
++
++import java.net.URI;
++import java.time.Duration;
++import java.util.concurrent.TimeUnit;
++import org.apache.tinkerpop.gremlin.driver.Cluster;
++import org.apache.tinkerpop.gremlin.driver.remote.DriverRemoteConnection;
++import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
++
++/**
++ * The single Gremlin driver connection ({@link Cluster} and its traversal source) of a
++ * {@link JanusGraphDatabaseFactory}, shared by all its products, which may use it from several threads. It is opened
++ * by the first product that connects and closed only by the factory.
++ *
++ * <p>The lock of this object guards the state only: it is never held while the server is contacted or between
++ * attempts, so that {@link #close()} never waits for a connect in progress.
++ */
++final class JanusGraphConnection {
++
++    private static final System.Logger LOG = System.getLogger(JanusGraphConnection.class.getName());
++
++    private final String url;
++    private Cluster cluster;
++    private GraphTraversalSource g;
++    private boolean opening;
++    private boolean closed;
++
++    JanusGraphConnection(String url) {
++        this.url = url;
++    }
++
++    /**
++     * Connects to the Gremlin server; does nothing if already connected. Concurrent calls wait for the one that is
++     * connecting instead of opening a driver of their own, and try themselves only if it fails. Closing the
++     * connection stops the attempts, and a driver that connects after the close is closed again.
++     *
++     * @param attempts number of attempts; the server may still be starting
++     * @param interval pause between attempts
++     * @throws IllegalStateException if the server cannot be reached or the connection is closed
++     */
++    void open(int attempts, Duration interval) {
++        if (!claimOpening()) {
++            return;
++        }
++        Cluster candidate = null;
++        GraphTraversalSource source = null;
++        try {
++            URI uri = URI.create(url);
++            candidate = Cluster.build(uri.getHost())
++                    .port(uri.getPort() > 0 ? uri.getPort() : 8182)
++                    .path(uri.getPath() == null || uri.getPath().isEmpty() ? "/gremlin" : uri.getPath())
++                    .enableSsl("wss".equalsIgnoreCase(uri.getScheme()))
++                    .create();
++            source = traversal().withRemote(DriverRemoteConnection.using(candidate, "g"));
++            RuntimeException last = null;
++            boolean connected = false;
++            for (int attempt = 1; attempt <= attempts && !connected; attempt++) {
++                checkNotClosed();
++                try {
++                    source.inject(1).next();
++                    connected = true;
++                } catch (RuntimeException e) {
++                    last = e;
++                    LOG.log(System.Logger.Level.WARNING, "Failed to connect to JanusGraph (attempt {0}): {1}", attempt,
++                            e.getMessage());
++                    pause(interval);
++                }
++            }
++            if (!connected) {
++                throw new IllegalStateException("Cannot connect to JanusGraph at " + url, last);
++            }
++            publish(candidate, source);
++            candidate = null;
++            source = null;
++            LOG.log(System.Logger.Level.INFO, "Connected to JanusGraph {0}", url);
++        } finally {
++            close(source, candidate);
++            finishOpening();
++        }
++    }
++
++    /**
++     * The traversal source of the connected server.
++     *
++     * @throws IllegalStateException if the connection is not open
++     */
++    synchronized GraphTraversalSource g() {
++        checkNotClosed();
++        if (g == null) {
++            throw new IllegalStateException("Not connected to JanusGraph; call connect() first");
++        }
++        return g;
++    }
++
++    synchronized void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("The JanusGraph connection is closed");
++        }
++    }
++
++    synchronized void close() {
++        closed = true;
++        notifyAll();
++        close(g, cluster);
++        g = null;
++        cluster = null;
++    }
++
++    /**
++     * Waits until no other thread is connecting.
++     *
++     * @return {@code true} if the caller must connect, {@code false} if the connection is open already
++     */
++    private synchronized boolean claimOpening() {
++        while (true) {
++            checkNotClosed();
++            if (g != null) {
++                return false;
++            }
++            if (!opening) {
++                opening = true;
++                return true;
++            }
++            try {
++                wait();
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                throw new IllegalStateException("Interrupted while waiting for the JanusGraph connection", e);
++            }
++        }
++    }
++
++    /** Keeps the connected driver, unless the connection was closed meanwhile. */
++    private synchronized void publish(Cluster connectedCluster, GraphTraversalSource connectedSource) {
++        checkNotClosed();
++        cluster = connectedCluster;
++        g = connectedSource;
++    }
++
++    private synchronized void finishOpening() {
++        opening = false;
++        notifyAll();
++    }
++
++    /** Waits for the pause between attempts, or less if the connection is closed meanwhile. */
++    private synchronized void pause(Duration interval) {
++        long deadline = System.nanoTime() + interval.toNanos();
++        long remaining = interval.toNanos();
++        while (!closed && remaining > 0) {
++            try {
++                TimeUnit.NANOSECONDS.timedWait(this, remaining);
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                return;
++            }
++            remaining = deadline - System.nanoTime();
++        }
++    }
++
++    private static void close(GraphTraversalSource source, Cluster connection) {
++        if (source != null) {
++            try {
++                source.close();
++            } catch (Exception e) {
++                LOG.log(System.Logger.Level.WARNING, "Failed to close the JanusGraph traversal source", e);
++            }
++        }
++        if (connection != null) {
++            connection.close();
++        }
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/JanusGraphAdapter.java b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphDatabase.java
+similarity index 59%
+rename from src/main/java/com/myorg/webservice/graph/JanusGraphAdapter.java
+rename to src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphDatabase.java
+index d195e6e..4175c78 100644
+--- a/src/main/java/com/myorg/webservice/graph/JanusGraphAdapter.java
++++ b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphDatabase.java
+@@ -1,8 +1,6 @@
+-package com.myorg.webservice.graph;
++package com.myorg.webservice.graph.janusgraph;
+ 
+-import static org.apache.tinkerpop.gremlin.process.traversal.AnonymousTraversalSource.traversal;
+-
+-import java.net.URI;
++import com.myorg.webservice.graph.GraphDatabase;
+ import java.time.Duration;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+@@ -11,8 +9,6 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
+-import org.apache.tinkerpop.gremlin.driver.Cluster;
+-import org.apache.tinkerpop.gremlin.driver.remote.DriverRemoteConnection;
+ import org.apache.tinkerpop.gremlin.process.traversal.P;
+ import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversal;
+ import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
+@@ -22,26 +18,23 @@ import org.apache.tinkerpop.gremlin.structure.Vertex;
+ import org.apache.tinkerpop.gremlin.structure.VertexProperty;
+ 
+ /**
+- * JanusGraph implementation of {@link GraphDb}, talking to a JanusGraph (Gremlin) server.
++ * JanusGraph product of {@link GraphDatabase}, talking to a JanusGraph (Gremlin) server.
+  *
+  * <p>Vertices have the label {@value #VERTEX} and their ID in the property {@value #VERTEX_ID}; edges have the label
+  * {@value #EDGE}. Queries are Gremlin traversals sent to the server's {@code g} traversal source.
+  */
+-public class JanusGraphAdapter implements GraphDb {
++public class JanusGraphDatabase implements GraphDatabase {
+ 
+     static final String VERTEX = "vertex";
+     /** Not "edge", which JanusGraph reserves. */
+     static final String EDGE = "link";
+     static final String VERTEX_ID = "vertexId";
+ 
+-    private static final System.Logger LOG = System.getLogger(JanusGraphAdapter.class.getName());
+-
+-    private final String url;
+-    private Cluster cluster;
+-    private GraphTraversalSource g;
++    private final JanusGraphConnection connection;
++    private volatile boolean closed;
+ 
+-    public JanusGraphAdapter(String url) {
+-        this.url = url;
++    JanusGraphDatabase(JanusGraphConnection connection) {
++        this.connection = connection;
+     }
+ 
+     @Override
+@@ -50,35 +43,15 @@ public class JanusGraphAdapter implements GraphDb {
+     }
+ 
+     /**
+-     * Connects to the Gremlin server.
++     * Opens the connection of the factory.
+      *
+      * @param attempts number of attempts; the server may still be starting
+      * @param interval pause between attempts
+      * @throws IllegalStateException if the server cannot be reached
+      */
+     public void connect(int attempts, Duration interval) {
+-        URI uri = URI.create(url);
+-        cluster = Cluster.build(uri.getHost())
+-                .port(uri.getPort() > 0 ? uri.getPort() : 8182)
+-                .path(uri.getPath() == null || uri.getPath().isEmpty() ? "/gremlin" : uri.getPath())
+-                .enableSsl("wss".equalsIgnoreCase(uri.getScheme()))
+-                .create();
+-        g = traversal().withRemote(DriverRemoteConnection.using(cluster, "g"));
+-        RuntimeException last = null;
+-        for (int attempt = 1; attempt <= attempts; attempt++) {
+-            try {
+-                g.inject(1).next();
+-                LOG.log(System.Logger.Level.INFO, "Connected to JanusGraph {0}", url);
+-                return;
+-            } catch (RuntimeException e) {
+-                last = e;
+-                LOG.log(System.Logger.Level.WARNING, "Failed to connect to JanusGraph (attempt {0}): {1}", attempt,
+-                        e.getMessage());
+-                sleep(interval);
+-            }
+-        }
+-        close();
+-        throw new IllegalStateException("Cannot connect to JanusGraph at " + url, last);
++        checkNotClosed();
++        connection.open(attempts, interval);
+     }
+ 
+     /**
+@@ -87,11 +60,12 @@ public class JanusGraphAdapter implements GraphDb {
+      */
+     @Override
+     public void ensureSchema() {
++        g();
+     }
+ 
+     @Override
+     public void upsertVertex(String id, Map<String, Object> properties) {
+-        GraphTraversal<Vertex, Vertex> vertex = g.V().has(VERTEX, VERTEX_ID, id).fold()
++        GraphTraversal<Vertex, Vertex> vertex = g().V().has(VERTEX, VERTEX_ID, id).fold()
+                 .coalesce(__.<Vertex>unfold(), __.<List<Vertex>>addV(VERTEX).property(VERTEX_ID, id));
+         for (Map.Entry<String, Object> property : properties.entrySet()) {
+             vertex = vertex.property(VertexProperty.Cardinality.single, property.getKey(), property.getValue());
+@@ -101,7 +75,7 @@ public class JanusGraphAdapter implements GraphDb {
+ 
+     @Override
+     public void upsertEdge(String fromId, String toId, Map<String, Object> properties) {
+-        GraphTraversal<Vertex, Edge> edge = g.V().has(VERTEX, VERTEX_ID, fromId).as("from")
++        GraphTraversal<Vertex, Edge> edge = g().V().has(VERTEX, VERTEX_ID, fromId).as("from")
+                 .V().has(VERTEX, VERTEX_ID, toId)
+                 .coalesce(__.<Vertex>inE(EDGE).where(__.outV().as("from")), __.<Vertex>addE(EDGE).from("from"));
+         for (Map.Entry<String, Object> property : properties.entrySet()) {
+@@ -112,7 +86,7 @@ public class JanusGraphAdapter implements GraphDb {
+ 
+     @Override
+     public Optional<Map<String, Object>> findVertex(String id) {
+-        return g.V().has(VERTEX, VERTEX_ID, id).valueMap().tryNext().map(values -> {
++        return g().V().has(VERTEX, VERTEX_ID, id).valueMap().tryNext().map(values -> {
+             Map<String, Object> properties = new HashMap<>();
+             values.forEach((key, value) -> properties.put(String.valueOf(key),
+                     value instanceof List<?> list && list.size() == 1 ? list.get(0) : value));
+@@ -124,6 +98,7 @@ public class JanusGraphAdapter implements GraphDb {
+     /** Breadth-first, one level per query, so that the result is ordered by hops and then by ID. */
+     @Override
+     public List<String> neighbors(String id, int depth) {
++        GraphTraversalSource g = g();
+         Set<String> visited = new HashSet<>(Set.of(id));
+         List<String> frontier = List.of(id);
+         List<String> result = new ArrayList<>();
+@@ -141,25 +116,17 @@ public class JanusGraphAdapter implements GraphDb {
+ 
+     @Override
+     public void close() {
+-        if (g != null) {
+-            try {
+-                g.close();
+-            } catch (Exception e) {
+-                LOG.log(System.Logger.Level.WARNING, "Failed to close the JanusGraph traversal source", e);
+-            }
+-            g = null;
+-        }
+-        if (cluster != null) {
+-            cluster.close();
+-            cluster = null;
+-        }
++        closed = true;
++    }
++
++    private GraphTraversalSource g() {
++        checkNotClosed();
++        return connection.g();
+     }
+ 
+-    private static void sleep(Duration interval) {
+-        try {
+-            Thread.sleep(interval);
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
++    private void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("This JanusGraph graph database is closed");
+         }
+     }
+ }
+diff --git a/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphDatabaseFactory.java b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphDatabaseFactory.java
+new file mode 100644
+index 0000000..ca11c82
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphDatabaseFactory.java
+@@ -0,0 +1,35 @@
++package com.myorg.webservice.graph.janusgraph;
++
++import com.myorg.webservice.graph.GraphDatabase;
++import com.myorg.webservice.graph.GraphDatabaseFactory;
++import com.myorg.webservice.graph.GraphStatistics;
++
++/** Concrete factory of the JanusGraph family. */
++public class JanusGraphDatabaseFactory implements GraphDatabaseFactory {
++
++    private final JanusGraphConnection connection;
++
++    /**
++     * @param url Gremlin server URL, e.g. {@code ws://localhost:8182/gremlin}
++     */
++    public JanusGraphDatabaseFactory(String url) {
++        this.connection = new JanusGraphConnection(url);
++    }
++
++    @Override
++    public GraphDatabase createDatabase() {
++        connection.checkNotClosed();
++        return new JanusGraphDatabase(connection);
++    }
++
++    @Override
++    public GraphStatistics createStatistics() {
++        connection.checkNotClosed();
++        return new JanusGraphStatistics(connection);
++    }
++
++    @Override
++    public void close() {
++        connection.close();
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphStatistics.java b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphStatistics.java
+new file mode 100644
+index 0000000..b26ece6
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/janusgraph/JanusGraphStatistics.java
+@@ -0,0 +1,54 @@
++package com.myorg.webservice.graph.janusgraph;
++
++import com.myorg.webservice.graph.GraphStatistics;
++import java.time.Duration;
++import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
++
++/** JanusGraph product of {@link GraphStatistics}, over the vertices and edges of {@link JanusGraphDatabase}. */
++public class JanusGraphStatistics implements GraphStatistics {
++
++    private final JanusGraphConnection connection;
++    private volatile boolean closed;
++
++    JanusGraphStatistics(JanusGraphConnection connection) {
++        this.connection = connection;
++    }
++
++    @Override
++    public void connect() {
++        checkNotClosed();
++        connection.open(30, Duration.ofSeconds(2));
++    }
++
++    @Override
++    public long vertexCount() {
++        return g().V().hasLabel(JanusGraphDatabase.VERTEX).count().next();
++    }
++
++    @Override
++    public long edgeCount() {
++        return g().E().hasLabel(JanusGraphDatabase.EDGE).count().next();
++    }
++
++    @Override
++    public long outDegree(String id) {
++        return g().V().has(JanusGraphDatabase.VERTEX, JanusGraphDatabase.VERTEX_ID, id)
++                .outE(JanusGraphDatabase.EDGE).count().next();
++    }
++
++    @Override
++    public void close() {
++        closed = true;
++    }
++
++    private GraphTraversalSource g() {
++        checkNotClosed();
++        return connection.g();
++    }
++
++    private void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("These JanusGraph statistics are closed");
++        }
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jConnection.java b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jConnection.java
+new file mode 100644
+index 0000000..1af4076
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jConnection.java
+@@ -0,0 +1,159 @@
++package com.myorg.webservice.graph.neo4j;
++
++import java.time.Duration;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++import org.neo4j.driver.AuthTokens;
++import org.neo4j.driver.Driver;
++import org.neo4j.driver.EagerResult;
++
++/**
++ * The single Neo4j driver of a {@link Neo4jDatabaseFactory}, shared by all its products, which may use it from
++ * several threads. It is opened by the first product that connects and closed only by the factory.
++ *
++ * <p>The lock of this object guards the state only: it is never held while the server is contacted or between
++ * attempts, so that {@link #close()} never waits for a connect in progress.
++ */
++final class Neo4jConnection {
++
++    private static final System.Logger LOG = System.getLogger(Neo4jConnection.class.getName());
++
++    private final String uri;
++    private final String user;
++    private final String password;
++    private Driver driver;
++    private boolean opening;
++    private boolean closed;
++
++    Neo4jConnection(String uri, String user, String password) {
++        this.uri = uri;
++        this.user = user;
++        this.password = password;
++    }
++
++    /**
++     * Connects to the server; does nothing if already connected. Concurrent calls wait for the one that is
++     * connecting instead of opening a driver of their own, and try themselves only if it fails. Closing the
++     * connection stops the attempts, and a driver that connects after the close is closed again.
++     *
++     * @param attempts number of attempts; the server may still be starting
++     * @param interval pause between attempts
++     * @throws IllegalStateException if the server cannot be reached or the connection is closed
++     */
++    void open(int attempts, Duration interval) {
++        if (!claimOpening()) {
++            return;
++        }
++        Driver candidate = null;
++        try {
++            candidate = org.neo4j.driver.GraphDatabase.driver(uri, AuthTokens.basic(user, password));
++            RuntimeException last = null;
++            boolean connected = false;
++            for (int attempt = 1; attempt <= attempts && !connected; attempt++) {
++                checkNotClosed();
++                try {
++                    candidate.verifyConnectivity();
++                    connected = true;
++                } catch (RuntimeException e) {
++                    last = e;
++                    LOG.log(System.Logger.Level.WARNING, "Failed to connect to Neo4j (attempt {0}): {1}", attempt,
++                            e.getMessage());
++                    pause(interval);
++                }
++            }
++            if (!connected) {
++                throw new IllegalStateException("Cannot connect to Neo4j at " + uri, last);
++            }
++            publish(candidate);
++            candidate = null;
++            LOG.log(System.Logger.Level.INFO, "Connected to Neo4j {0}", uri);
++        } finally {
++            if (candidate != null) {
++                candidate.close();
++            }
++            finishOpening();
++        }
++    }
++
++    /**
++     * Runs a Cypher query on the connected server.
++     *
++     * @throws IllegalStateException if the connection is not open
++     */
++    EagerResult run(String query, Map<String, Object> parameters) {
++        return driver().executableQuery(query).withParameters(parameters).execute();
++    }
++
++    synchronized void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("The Neo4j connection is closed");
++        }
++    }
++
++    synchronized void close() {
++        closed = true;
++        notifyAll();
++        if (driver != null) {
++            driver.close();
++            driver = null;
++        }
++    }
++
++    private synchronized Driver driver() {
++        checkNotClosed();
++        if (driver == null) {
++            throw new IllegalStateException("Not connected to Neo4j; call connect() first");
++        }
++        return driver;
++    }
++
++    /**
++     * Waits until no other thread is connecting.
++     *
++     * @return {@code true} if the caller must connect, {@code false} if the connection is open already
++     */
++    private synchronized boolean claimOpening() {
++        while (true) {
++            checkNotClosed();
++            if (driver != null) {
++                return false;
++            }
++            if (!opening) {
++                opening = true;
++                return true;
++            }
++            try {
++                wait();
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                throw new IllegalStateException("Interrupted while waiting for the Neo4j connection", e);
++            }
++        }
++    }
++
++    /** Keeps the connected driver, unless the connection was closed meanwhile. */
++    private synchronized void publish(Driver connected) {
++        checkNotClosed();
++        driver = connected;
++    }
++
++    private synchronized void finishOpening() {
++        opening = false;
++        notifyAll();
++    }
++
++    /** Waits for the pause between attempts, or less if the connection is closed meanwhile. */
++    private synchronized void pause(Duration interval) {
++        long deadline = System.nanoTime() + interval.toNanos();
++        long remaining = interval.toNanos();
++        while (!closed && remaining > 0) {
++            try {
++                TimeUnit.NANOSECONDS.timedWait(this, remaining);
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                return;
++            }
++            remaining = deadline - System.nanoTime();
++        }
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/Neo4jAdapter.java b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jDatabase.java
+similarity index 62%
+rename from src/main/java/com/myorg/webservice/graph/Neo4jAdapter.java
+rename to src/main/java/com/myorg/webservice/graph/neo4j/Neo4jDatabase.java
+index 6555857..add4f35 100644
+--- a/src/main/java/com/myorg/webservice/graph/Neo4jAdapter.java
++++ b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jDatabase.java
+@@ -1,39 +1,31 @@
+-package com.myorg.webservice.graph;
++package com.myorg.webservice.graph.neo4j;
+ 
++import com.myorg.webservice.graph.GraphDatabase;
+ import java.time.Duration;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+-import org.neo4j.driver.AuthTokens;
+-import org.neo4j.driver.Driver;
+ import org.neo4j.driver.EagerResult;
+-import org.neo4j.driver.GraphDatabase;
+ import org.neo4j.driver.Record;
+ 
+ /**
+- * Neo4j implementation of {@link GraphDb}.
++ * Neo4j product of {@link GraphDatabase}.
+  *
+  * <p>Vertices are nodes labelled {@value #VERTEX} whose ID is the unique property {@value #VERTEX_ID}, and edges are
+  * relationships of type {@value #EDGE}. Queries are written in Cypher.
+  */
+-public class Neo4jAdapter implements GraphDb {
++public class Neo4jDatabase implements GraphDatabase {
+ 
+     static final String VERTEX = "Vertex";
+     static final String EDGE = "EDGE";
+     static final String VERTEX_ID = "vertexId";
+ 
+-    private static final System.Logger LOG = System.getLogger(Neo4jAdapter.class.getName());
++    private final Neo4jConnection connection;
++    private volatile boolean closed;
+ 
+-    private final String uri;
+-    private final String user;
+-    private final String password;
+-    private Driver driver;
+-
+-    public Neo4jAdapter(String uri, String user, String password) {
+-        this.uri = uri;
+-        this.user = user;
+-        this.password = password;
++    Neo4jDatabase(Neo4jConnection connection) {
++        this.connection = connection;
+     }
+ 
+     @Override
+@@ -42,30 +34,15 @@ public class Neo4jAdapter implements GraphDb {
+     }
+ 
+     /**
+-     * Connects to the server.
++     * Opens the connection of the factory.
+      *
+      * @param attempts number of attempts; the server may still be starting
+      * @param interval pause between attempts
+      * @throws IllegalStateException if the server cannot be reached
+      */
+     public void connect(int attempts, Duration interval) {
+-        driver = GraphDatabase.driver(uri, AuthTokens.basic(user, password));
+-        RuntimeException last = null;
+-        for (int attempt = 1; attempt <= attempts; attempt++) {
+-            try {
+-                driver.verifyConnectivity();
+-                LOG.log(System.Logger.Level.INFO, "Connected to Neo4j {0}", uri);
+-                return;
+-            } catch (RuntimeException e) {
+-                last = e;
+-                LOG.log(System.Logger.Level.WARNING, "Failed to connect to Neo4j (attempt {0}): {1}", attempt,
+-                        e.getMessage());
+-                sleep(interval);
+-            }
+-        }
+-        driver.close();
+-        driver = null;
+-        throw new IllegalStateException("Cannot connect to Neo4j at " + uri, last);
++        checkNotClosed();
++        connection.open(attempts, interval);
+     }
+ 
+     @Override
+@@ -100,6 +77,8 @@ public class Neo4jAdapter implements GraphDb {
+ 
+     @Override
+     public List<String> neighbors(String id, int depth) {
++        checkNotClosed();
++        connection.checkNotClosed();
+         if (depth < 1) {
+             return List.of();
+         }
+@@ -117,21 +96,17 @@ public class Neo4jAdapter implements GraphDb {
+ 
+     @Override
+     public void close() {
+-        if (driver != null) {
+-            driver.close();
+-            driver = null;
+-        }
++        closed = true;
+     }
+ 
+     private EagerResult run(String query, Map<String, Object> parameters) {
+-        return driver.executableQuery(query).withParameters(parameters).execute();
++        checkNotClosed();
++        return connection.run(query, parameters);
+     }
+ 
+-    private static void sleep(Duration interval) {
+-        try {
+-            Thread.sleep(interval);
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
++    private void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("This Neo4j graph database is closed");
+         }
+     }
+ }
+diff --git a/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jDatabaseFactory.java b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jDatabaseFactory.java
+new file mode 100644
+index 0000000..1596662
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jDatabaseFactory.java
+@@ -0,0 +1,37 @@
++package com.myorg.webservice.graph.neo4j;
++
++import com.myorg.webservice.graph.GraphDatabase;
++import com.myorg.webservice.graph.GraphDatabaseFactory;
++import com.myorg.webservice.graph.GraphStatistics;
++
++/** Concrete factory of the Neo4j family. */
++public class Neo4jDatabaseFactory implements GraphDatabaseFactory {
++
++    private final Neo4jConnection connection;
++
++    /**
++     * @param uri      Bolt URI, e.g. {@code bolt://localhost:7687}
++     * @param user     user name
++     * @param password password
++     */
++    public Neo4jDatabaseFactory(String uri, String user, String password) {
++        this.connection = new Neo4jConnection(uri, user, password);
++    }
++
++    @Override
++    public GraphDatabase createDatabase() {
++        connection.checkNotClosed();
++        return new Neo4jDatabase(connection);
++    }
++
++    @Override
++    public GraphStatistics createStatistics() {
++        connection.checkNotClosed();
++        return new Neo4jStatistics(connection);
++    }
++
++    @Override
++    public void close() {
++        connection.close();
++    }
++}
+diff --git a/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jStatistics.java b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jStatistics.java
+new file mode 100644
+index 0000000..f9f8868
+--- /dev/null
++++ b/src/main/java/com/myorg/webservice/graph/neo4j/Neo4jStatistics.java
+@@ -0,0 +1,53 @@
++package com.myorg.webservice.graph.neo4j;
++
++import com.myorg.webservice.graph.GraphStatistics;
++import java.time.Duration;
++import java.util.Map;
++
++/** Neo4j product of {@link GraphStatistics}, over the nodes and relationships of {@link Neo4jDatabase}. */
++public class Neo4jStatistics implements GraphStatistics {
++
++    private final Neo4jConnection connection;
++    private volatile boolean closed;
++
++    Neo4jStatistics(Neo4jConnection connection) {
++        this.connection = connection;
++    }
++
++    @Override
++    public void connect() {
++        checkNotClosed();
++        connection.open(30, Duration.ofSeconds(2));
++    }
++
++    @Override
++    public long vertexCount() {
++        return count("MATCH (v:Vertex) RETURN count(v) AS n", Map.of());
++    }
++
++    @Override
++    public long edgeCount() {
++        return count("MATCH (:Vertex)-[e:EDGE]->(:Vertex) RETURN count(e) AS n", Map.of());
++    }
++
++    @Override
++    public long outDegree(String id) {
++        return count("MATCH (v:Vertex {vertexId: $id})-[e:EDGE]->() RETURN count(e) AS n", Map.of("id", id));
++    }
++
++    @Override
++    public void close() {
++        closed = true;
++    }
++
++    private long count(String query, Map<String, Object> parameters) {
++        checkNotClosed();
++        return connection.run(query, parameters).records().get(0).get("n").asLong();
++    }
++
++    private void checkNotClosed() {
++        if (closed) {
++            throw new IllegalStateException("These Neo4j statistics are closed");
++        }
++    }
++}
